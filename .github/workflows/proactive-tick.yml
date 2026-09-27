@@ -1,0 +1,68 @@
+name: 主动联系心跳
+
+# 为什么用 GitHub Actions 而不是 Vercel cron：
+# Vercel Hobby 的 crons 一天只能触发一次，写成 */10 会让整个部署失败。
+# 主动联系要的是「离线时也有人来敲门」——每 10 分钟打一次 /api/internal/proactive，
+# 站点函数自己按 next_at 排期决定这一轮要不要判断、判断谁，所以空跑很便宜。
+#
+# 这个文件不必和站点代码在同一个仓库：它只做一次 HTTPS 调用。
+# 实际放在 github.com/fengyewfdhjfd/aarome-proactive-tick（公开仓库 = Actions 不限分钟数，
+# 私有仓库每月只有 2000 分钟；这里每次跑约 10 秒，一个月约 750 分钟）。
+# 配置步骤见那个仓库的 README。
+#
+# 需要在仓库 Secrets 里配两个值：
+#   PERSONA_SITE_URL          例如 https://www.aarome.xyz
+#   PERSONA_PROACTIVE_TOKEN   与 Vercel 环境变量 PERSONA_PROACTIVE_TOKEN 同一个值
+# 站点端没配这个环境变量时接口返回 503，这里按「正常但没开」处理，不报警。
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: proactive-tick
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: 敲一次心跳
+        env:
+          SITE: ${{ secrets.PERSONA_SITE_URL }}
+          TOK: ${{ secrets.PERSONA_PROACTIVE_TOKEN }}
+        run: |
+          set -u
+          if [ -z "${SITE:-}" ] || [ -z "${TOK:-}" ]; then
+            echo "::warning::没配 PERSONA_SITE_URL / PERSONA_PROACTIVE_TOKEN，这一轮跳过"
+            exit 0
+          fi
+          # 先探一下站点这一版有没有心跳入口：/health 里 proactive_timer=false
+          # 说明代码已上线但 token 没配，true 才是「可以敲」。老构建没这个字段。
+          h=$(curl -sS --max-time 20 "$SITE/health" 2>/dev/null || echo '')
+          case "$h" in
+            *'"proactive_timer":true'*|*'"proactive_timer": true'*) ;;
+            *'"proactive_timer":false'*|*'"proactive_timer": false'*)
+              echo "::warning::站点已上线心跳接口，但 Vercel 还没配 PERSONA_PROACTIVE_TOKEN"; exit 0 ;;
+            *)
+              echo "::warning::站点这一版还没有主动联系心跳接口（未部署或 /health 不通），跳过"; exit 0 ;;
+          esac
+          # token 走请求头，不进 URL —— 免得留在 CDN / 访问日志的查询串里
+          hit() {
+            code=$(curl -sS -o body.json -w '%{http_code}' --max-time 120 \
+                     -H "X-Proactive-Token: $TOK" "$SITE/api/internal/proactive" || echo 000)
+            echo "HTTP $code $(head -c 400 body.json 2>/dev/null)"
+          }
+          hit
+          case "$code" in
+            200|404|429|503) exit 0 ;;      # 404 = 老构建；429 = 打得太密；503 = 站点没开启这个定时器
+            *) echo "第一轮失败，20 秒后补一次"; sleep 20; hit ;;
+          esac
+          case "$code" in
+            200|404|429|503) exit 0 ;;
+            *) echo "::error::心跳失败：HTTP $code"; exit 1 ;;
+          esac
